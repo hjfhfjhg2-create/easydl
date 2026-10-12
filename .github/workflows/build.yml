@@ -1,0 +1,74 @@
+name: Build EasyDL APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "main.py"
+      - "buildozer.spec"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip \
+            autoconf automake libtool \
+            pkg-config cmake \
+            zlib1g-dev libffi-dev \
+            libssl-dev libltdl-dev \
+            build-essential \
+            ccache \
+            gettext
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install buildozer cython==0.29.36
+
+      - name: Verify project files
+        run: |
+          test -f main.py
+          test -f buildozer.spec
+          echo "Project files found."
+
+      - name: Build APK
+        run: |
+          yes | buildozer android debug
+        env:
+          P4A_RELEASE_KEYSTORE: ""
+          CI: "1"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyDL-APK
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 14
