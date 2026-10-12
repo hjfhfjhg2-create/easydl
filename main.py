@@ -69,6 +69,7 @@ def register_arabic_font():
 
 register_arabic_font()
 
+NL = chr(10)  # سطر جديد (من غير backslash عشان النسخ ما يكسرهوش)
 _AR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 
@@ -81,7 +82,7 @@ def ar(text):
     if not text or not has_ar(text):
         return text
     try:
-        return "\n".join(get_display(arabic_reshaper.reshape(line)) for line in text.split("\n"))
+        return NL.join(get_display(arabic_reshaper.reshape(line)) for line in text.split(NL))
     except Exception:
         return text
 
@@ -257,7 +258,7 @@ class EasyDL(App):
         shown = ar(text)
         def update(_dt):
             self.log_lines.append(shown)
-            self.log_label.text = "\n".join(self.log_lines)
+            self.log_label.text = NL.join(self.log_lines)
         Clock.schedule_once(update, 0)
 
     def start_download(self, *_):
@@ -268,4 +269,217 @@ class EasyDL(App):
         if self.busy:
             return
         if not (url.startswith("https://") or url.startswith("http://")):
-            self.set_status("الرابط غير صح
+            self.set_status("الرابط غير صحيح - استخدم رابطًا يبدأ بـ http أو https")
+            return
+        self.busy = True
+        self.success_count = 0
+        self.failure_count = 0
+        self.downloaded_paths = []
+        self.download_btn.disabled = True
+        self.progress.value = 0
+        self.percent_label.text = "0%"
+        mode = self.mode
+        video_quality = self.quality.text
+        audio_quality = self.audio_quality.text
+        threading.Thread(target=self.download_worker,
+                         args=(url, mode, video_quality, audio_quality), daemon=True).start()
+
+    def output_folder(self):
+        # Download to app-private temporary storage first; then publish to Android Downloads.
+        if platform == "android":
+            folder = os.path.join(self.user_data_dir, "EasyDL_temp")
+        else:
+            folder = os.path.join(str(Path.home()), "Downloads", "EasyDL")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def publish_android_download(self, source_path):
+        if platform != "android":
+            target_dir = os.path.join(str(Path.home()), "Downloads", "EasyDL")
+            os.makedirs(target_dir, exist_ok=True)
+            target = os.path.join(target_dir, os.path.basename(source_path))
+            if os.path.abspath(source_path) != os.path.abspath(target):
+                shutil.copy2(source_path, target)
+            return target
+        # Android 10+: use MediaStore so the result appears in the public Downloads collection.
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        MediaStore = autoclass('android.provider.MediaStore')
+        ContentValues = autoclass('android.content.ContentValues')
+        BuildVersion = autoclass('android.os.Build$VERSION')
+        activity = PythonActivity.mActivity
+        resolver = activity.getContentResolver()
+        values = ContentValues()
+        filename = os.path.basename(source_path)
+        ext = os.path.splitext(filename)[1].lower()
+        mime = 'audio/mpeg' if ext == '.mp3' else ('video/mp4' if ext == '.mp4' else 'application/octet-stream')
+        values.put('_display_name', filename)
+        values.put('mime_type', mime)
+        if int(BuildVersion.SDK_INT) >= 29:
+            values.put('relative_path', 'Download/EasyDL')
+            values.put('is_pending', 1)
+        uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            raise RuntimeError('أندرويد لم يسمح بحفظ الملف في مجلد التنزيلات')
+        output_stream = resolver.openOutputStream(uri)
+        try:
+            with open(source_path, 'rb') as src:
+                while True:
+                    chunk = src.read(64 * 1024)
+                    if not chunk:
+                        break
+                    output_stream.write(bytearray(chunk))
+            output_stream.flush()
+        finally:
+            output_stream.close()
+        if int(BuildVersion.SDK_INT) >= 29:
+            done = ContentValues()
+            done.put('is_pending', 0)
+            resolver.update(uri, done, None, None)
+        return f"Download/EasyDL/{filename}"
+
+    def find_ffmpeg_dir(self):
+        """Return a folder containing an executable named 'ffmpeg', or None."""
+        if platform != "android":
+            exe = shutil.which("ffmpeg")
+            return os.path.dirname(exe) if exe else None
+        try:
+            from jnius import autoclass
+            activity = autoclass('org.kivy.android.PythonActivity').mActivity
+            lib = os.path.join(activity.getApplicationInfo().nativeLibraryDir, "libffmpeg.so")
+            if not os.path.exists(lib):
+                return None
+            bindir = os.path.join(self.user_data_dir, "bin")
+            os.makedirs(bindir, exist_ok=True)
+            link = os.path.join(bindir, "ffmpeg")
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(lib, link)
+            return bindir
+        except Exception:
+            return None
+
+    def progress_hook(self, data):
+        if data.get('status') == 'downloading':
+            total = data.get('total_bytes') or data.get('total_bytes_estimate') or 0
+            downloaded = data.get('downloaded_bytes') or 0
+            pct = (downloaded * 100 / total) if total else 0
+            info = data.get('info_dict') or {}
+            idx, total_entries = info.get('playlist_index'), info.get('n_entries')
+            prefix = f"عنصر {idx}/{total_entries} · " if idx and total_entries else ""
+            speed = (data.get('_speed_str') or '').strip()
+            self.set_status(f"{prefix}جارٍ التحميل... {speed}", pct)
+        elif data.get('status') == 'finished':
+            filename = data.get('filename')
+            if filename:
+                self.downloaded_paths.append(filename)
+            self.set_status("اكتمل تنزيل أحد الملفات...", 100)
+
+    def download_worker(self, url, mode, video_quality, audio_quality):
+        folder = self.output_folder()
+        before = {}
+        for base, _, names in os.walk(folder):
+            for name in names:
+                p = os.path.join(base, name)
+                try:
+                    before[p] = os.path.getmtime(p)
+                except OSError:
+                    pass
+        template = os.path.join(folder, '%(playlist_title|Playlist)s/%(playlist_index|0)03d - %(title).180B.%(ext)s')
+        # yt-dlp may not support every site or every playlist entry; don't fabricate success.
+        opts = {
+            'outtmpl': template,
+            'noplaylist': False,
+            'ignoreerrors': True,
+            'retries': 5,
+            'fragment_retries': 5,
+            'quiet': True,
+            'no_warnings': False,
+            'progress_hooks': [self.progress_hook],
+            'windowsfilenames': False,
+            'overwrites': False,
+            'continuedl': True,
+        }
+        ff_dir = self.find_ffmpeg_dir()
+        if ff_dir:
+            opts['ffmpeg_location'] = ff_dir
+        if mode == 'video':
+            height = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360}.get(video_quality)
+            if ff_dir:
+                # FFmpeg available: allow separate video+audio and merge them into mp4.
+                if height:
+                    opts['format'] = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best[height<={height}]/best'
+                else:
+                    opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+                opts['merge_output_format'] = 'mp4'
+            elif height:
+                opts['format'] = f'best[height<={height}][ext=mp4]/best[height<={height}]/best'
+            else:
+                opts['format'] = 'best[ext=mp4]/best'
+        else:
+            if audio_quality == AUDIO_ORIGINAL:
+                opts['format'] = 'bestaudio/best'
+            else:
+                if not ff_dir:
+                    self.set_status('تحويل MP3 يحتاج FFmpeg مدمجًا مع نسخة أندرويد')
+                    self.add_log('لم يبدأ التحميل: نسخة APK الحالية لا تحتوي على برنامج FFmpeg اللازم لتحويل الصوت إلى MP3. استخدم الصوت الأصلي مؤقتًا أو أضف FFmpeg Android إلى البناء.')
+                    self.finish_worker()
+                    return
+                bitrate = {'MP3 · 320 kbps': '320', 'MP3 · 192 kbps': '192', 'MP3 · 128 kbps': '128'}.get(audio_quality, '192')
+                opts['format'] = 'bestaudio/best'
+                opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': bitrate}]
+        try:
+            self.set_status('جارٍ تحليل الرابط...', 0)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    raise RuntimeError('تعذر قراءة الرابط')
+                if info.get('_type') == 'playlist' or info.get('entries') is not None:
+                    entries = info.get('entries') or []
+                    self.current_playlist_total = len(entries)
+                    self.set_status(f'تم العثور على قائمة تضم {len(entries)} عنصرًا - جارٍ التنزيل', 0)
+                    self.add_log(f'قائمة تشغيل: {info.get("title") or "بدون عنوان"} · {len(entries)} عنصرًا')
+                else:
+                    self.set_status('تم تحليل الرابط - جارٍ التنزيل', 0)
+                ydl.download([url])
+            # Only count non-empty completed output files.
+            candidates = []
+            for base, _, files in os.walk(folder):
+                for name in files:
+                    p = os.path.join(base, name)
+                    if os.path.isfile(p) and os.path.getsize(p) > 0 and not name.endswith(('.part', '.ytdl')):
+                        try:
+                            if p not in before or os.path.getmtime(p) > before[p]:
+                                candidates.append(p)
+                        except OSError:
+                            pass
+            published = []
+            for path in candidates:
+                try:
+                    target = self.publish_android_download(path)
+                    published.append(target)
+                except Exception as ex:
+                    self.add_log(f'تعذر إظهار الملف في Downloads: {os.path.basename(path)} - {ex}')
+            if published:
+                self.success_count = len(published)
+                self.set_status(f'اكتمل التحميل: {self.success_count} ملف', 100)
+                for item in published:
+                    self.add_log('تم: ' + item)
+            else:
+                self.set_status('لم يكتمل أي ملف', 0)
+                self.add_log('لم يتم العثور على ملفات مكتملة. قد يكون الموقع غير مدعوم أو الرابط محميًا.')
+        except Exception as exc:
+            self.set_status('فشل التحميل')
+            self.add_log('خطأ: ' + str(exc))
+        finally:
+            self.finish_worker()
+
+    def finish_worker(self):
+        def done(_dt):
+            self.busy = False
+            self.download_btn.disabled = False
+        Clock.schedule_once(done, 0)
+
+
+if __name__ == '__main__':
+    EasyDL().run()
