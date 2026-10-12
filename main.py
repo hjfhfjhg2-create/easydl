@@ -93,7 +93,8 @@ class DL(App):
             return
         self.btn.disabled = True
         self.bar.value = 0
-        threading.Thread(target=self.run, args=(url, self.mp3.state == "down"),
+        threading.Thread(target=self.do_download,
+                         args=(url, self.mp3.state == "down"),
                          daemon=True).start()
 
     def hook(self, d):
@@ -108,7 +109,7 @@ class DL(App):
         elif d["status"] == "finished":
             self.add_log("Downloaded: " + os.path.basename(d.get("filename", "")))
 
-    def run(self, url, audio):
+    def do_download(self, url, audio):
         try:
             folder = get_folder()
             tmpl = os.path.join(
