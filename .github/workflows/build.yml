@@ -1,74 +1,60 @@
 name: Build EasyDL APK
-
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    paths:
-      - "main.py"
-      - "buildozer.spec"
-      - ".github/workflows/build.yml"
-
-permissions:
-  contents: read
-
+    branches: [main]
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+          java-version: '17'
+      - name: Cache buildozer
+        uses: actions/cache@v4
         with:
-          python-version: "3.11"
-
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip \
-            autoconf automake libtool \
-            pkg-config cmake \
-            zlib1g-dev libffi-dev \
-            libssl-dev libltdl-dev \
-            build-essential \
-            ccache \
-            gettext
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install buildozer cython==0.29.36
-
-      - name: Verify project files
-        run: |
-          test -f main.py
-          test -f buildozer.spec
-          echo "Project files found."
-
+          sudo apt-get install -y git zip unzip autoconf automake libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libltdl-dev libssl-dev build-essential ccache
+          pip install --upgrade pip
+          pip install buildozer 'cython<3' setuptools
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: libs/arm64-v8a
+          key: ffmpeg-${{ hashFiles('build_ffmpeg.sh') }}
+      - name: Build FFmpeg (optional - APK still builds if this fails)
+        id: ff
+        continue-on-error: true
+        run: bash build_ffmpeg.sh
+      - name: Add FFmpeg to APK
+        if: steps.ff.outcome == 'success'
+        run: sed -i '/^\[app\]/a android.add_libs_arm64_v8a = libs/arm64-v8a/*.so' buildozer.spec
       - name: Build APK
-        run: |
-          yes | buildozer android debug
-        env:
-          P4A_RELEASE_KEYSTORE: ""
-          CI: "1"
-
+        shell: bash
+        run: buildozer -v android debug 2>&1 | tee build.log
+      - name: Show build log on failure
+        if: failure()
+        run: tail -n 100 build.log
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EasyDL-APK
+          name: easydl-apk
           path: bin/*.apk
-          if-no-files-found: error
-          retention-days: 14
